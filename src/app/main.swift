@@ -6,8 +6,11 @@ import ServiceManagement
 // All SMC writes go through the magled-helper root daemon (Unix socket).
 // Reads are done directly (no root needed).
 
-let kNightStartHour = 23
-let kNightEndHour = 7
+// 夜间时段改为可配置：以「当天 0 点起的分钟数」存在 UserDefaults 里
+let kNightStartKey = "NightStartMinutes"
+let kNightEndKey = "NightEndMinutes"
+let kNightDefaultStart = 23 * 60   // 23:00
+let kNightDefaultEnd = 7 * 60      // 07:00
 let kNightPrefKey = "NightScheduleEnabled"
 let kLastModeKey = "LastMode"
 
@@ -23,6 +26,9 @@ final class MagLEDController: NSObject, NSMenuDelegate {
     var itemGreen: NSMenuItem!
     var itemAmber: NSMenuItem!
     var itemNight: NSMenuItem!
+    var itemNightWindow: NSMenuItem!
+    var itemNightStart: NSMenuItem!
+    var itemNightEnd: NSMenuItem!
     var itemLogin: NSMenuItem!
     var itemHelperStatus: NSMenuItem!
     var itemInstall: NSMenuItem!
@@ -87,6 +93,28 @@ final class MagLEDController: NSObject, NSMenuDelegate {
         itemNight.target = self
         menu.addItem(itemNight)
 
+        // 夜间时段设置（子菜单：开始/结束时间 + 快捷预设）
+        itemNightWindow = NSMenuItem(title: "夜间时段：23:00 – 07:00", action: nil, keyEquivalent: "")
+        let windowMenu = NSMenu()
+        itemNightStart = NSMenuItem(title: "设置开始时间…", action: #selector(pickNightStart), keyEquivalent: "")
+        itemNightStart.target = self
+        windowMenu.addItem(itemNightStart)
+        itemNightEnd = NSMenuItem(title: "设置结束时间…", action: #selector(pickNightEnd), keyEquivalent: "")
+        itemNightEnd.target = self
+        windowMenu.addItem(itemNightEnd)
+        windowMenu.addItem(.separator())
+        for (label, s, e) in [("22:00 – 08:00", 22 * 60, 8 * 60),
+                              ("23:00 – 07:00（默认）", 23 * 60, 7 * 60),
+                              ("00:00 – 06:00", 0, 6 * 60),
+                              ("01:00 – 09:00", 60, 9 * 60)] {
+            let preset = NSMenuItem(title: label, action: #selector(applyNightPreset(_:)), keyEquivalent: "")
+            preset.target = self
+            preset.representedObject = [s, e]
+            windowMenu.addItem(preset)
+        }
+        itemNightWindow.submenu = windowMenu
+        menu.addItem(itemNightWindow)
+
         itemLogin = NSMenuItem(title: "开机时启动", action: #selector(toggleLogin), keyEquivalent: "")
         itemLogin.target = self
         menu.addItem(itemLogin)
@@ -111,6 +139,7 @@ final class MagLEDController: NSObject, NSMenuDelegate {
         let quit = NSMenuItem(title: "退出 MagLED", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
+        updateNightTitles()
 
         // wake/sleep re-assertion
         let dnc = DistributedNotificationCenter.default()
@@ -290,6 +319,7 @@ final class MagLEDController: NSObject, NSMenuDelegate {
             item.state = (current == v) ? .on : .off
         }
         itemNight.state = nightEnabled ? .on : .off
+        updateNightTitles()
         itemHelperStatus.title = helperUp ? "后台守护: 运行中 ✓" : "后台守护: 未安装"
         // 守护在跑但二进制旧了 → 显示"更新"入口（点一次输一次密码，之后不再问）；
         // 未安装 → 显示"安装"；已是最新 → 隐藏。
@@ -458,9 +488,84 @@ final class MagLEDController: NSObject, NSMenuDelegate {
 
     // ---- night schedule ----
 
+    // 时段存取：0 点起的分钟数
+    var nightStartMinutes: Int {
+        get { UserDefaults.standard.object(forKey: kNightStartKey) as? Int ?? kNightDefaultStart }
+        set { UserDefaults.standard.set(newValue, forKey: kNightStartKey); updateNightTitles() }
+    }
+    var nightEndMinutes: Int {
+        get { UserDefaults.standard.object(forKey: kNightEndKey) as? Int ?? kNightDefaultEnd }
+        set { UserDefaults.standard.set(newValue, forKey: kNightEndKey); updateNightTitles() }
+    }
+
+    func hhmm(_ minutes: Int) -> String {
+        String(format: "%02d:%02d", (minutes / 60) % 24, minutes % 60)
+    }
+
+    static func parseHHMM(_ text: String) -> Int? {
+        let parts = text.trimmingCharacters(in: .whitespaces).split(separator: ":")
+        guard parts.count == 2,
+              let h = Int(parts[0]), let m = Int(parts[1]),
+              (0...23).contains(h), (0...59).contains(m) else { return nil }
+        return h * 60 + m
+    }
+
+    func updateNightTitles() {
+        let window = "\(hhmm(nightStartMinutes)) – \(hhmm(nightEndMinutes))"
+        itemNight?.title = "夜间自动关灯（\(window)）"
+        itemNightWindow?.title = "夜间时段：\(window)"
+        itemNightStart?.title = "设置开始时间…（现在 \(hhmm(nightStartMinutes))）"
+        itemNightEnd?.title = "设置结束时间…（现在 \(hhmm(nightEndMinutes))）"
+    }
+
+    @objc func pickNightStart() { promptNightTime(isStart: true) }
+    @objc func pickNightEnd() { promptNightTime(isStart: false) }
+
+    @objc func applyNightPreset(_ sender: NSMenuItem) {
+        guard let pair = sender.representedObject as? [Int], pair.count == 2 else { return }
+        nightStartMinutes = pair[0]
+        nightEndMinutes = pair[1]
+        evaluateNight(force: true)
+    }
+
+    func promptNightTime(isStart: Bool) {
+        let alert = NSAlert()
+        alert.messageText = isStart ? "夜间关灯开始时间" : "夜间恢复时间"
+        alert.informativeText = "24 小时制，格式 HH:MM，例如 22:30 或 06:45"
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.stringValue = hhmm(isStart ? nightStartMinutes : nightEndMinutes)
+        field.alignment = .center
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        NSApp.activate(ignoringOtherApps: true)
+        let resp = alert.runModal()
+        guard resp == .alertFirstButtonReturn else { return }
+        guard let minutes = Self.parseHHMM(field.stringValue) else {
+            flash(title: "时间格式不对，请用 HH:MM（例如 22:30）")
+            return
+        }
+        if isStart { nightStartMinutes = minutes } else { nightEndMinutes = minutes }
+        evaluateNight(force: true)
+    }
+
+    /// 立即按新的时间窗判断一次（改完时间不用等下一个 30 秒 tick）
+    func evaluateNight(force: Bool) {
+        guard nightEnabled else { flash(title: "时段已保存（夜间计划未开启）"); return }
+        let shouldOff = inNight()
+        nightApplied = !shouldOff
+        tick()
+        flash(title: shouldOff ? "已按新时段关灯" : "当前不在关灯时段")
+    }
+
     func inNight() -> Bool {
-        let h = Calendar.current.component(.hour, from: Date())
-        return h >= kNightStartHour || h < kNightEndHour
+        let comps = Calendar.current.dateComponents([.hour, .minute], from: Date())
+        let now = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+        let s = nightStartMinutes, e = nightEndMinutes
+        if s == e { return false }                    // 起止相同 = 不启用
+        return s < e ? (now >= s && now < e)          // 同一天内的窗口
+                     : (now >= s || now < e)          // 跨零点
     }
 
     func tick() {
